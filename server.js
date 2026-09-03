@@ -6,7 +6,6 @@ const jwt = require('jsonwebtoken');
 const cookieParser = require('cookie-parser');
 const { GoogleAuth } = require('google-auth-library');
 const { google } = require('googleapis');
-const { createClient } = require('@supabase/supabase-js');
 const bcrypt = require('bcryptjs');
 const path = require('path');
 
@@ -22,12 +21,6 @@ const SHEET_ID = '';
 const SHEET_TAB = 'dashboard_data';
 const REVIEW_COOKIE = 'pp_reviewer';
 const DASH_COOKIE = 'centex-asphalt-dashboard';
-
-// ── Supabase ───────────────────────────────────────────────────────────────
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
 
 // ── Google auth (service account) ─────────────────────────────────────────
 const serviceAccountCreds = {
@@ -67,7 +60,9 @@ function readSession(req) {
     const token = req.cookies?.[REVIEW_COOKIE];
     if (!token) return null;
     return jwt.verify(token, process.env.SESSION_SECRET || 'pennpain-secret');
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 // ── GA4 proxy ──────────────────────────────────────────────────────────────
@@ -76,11 +71,15 @@ app.post('/api/ga4', async (req, res) => {
     const token = await getGAToken();
     const response = await axios.post(
       `https://analyticsdata.googleapis.com/v1beta/${GA4_PROPERTY}:runReport`,
-      req.body, { headers: { Authorization: `Bearer ${token}` } }
+      req.body,
+      { headers: { Authorization: `Bearer ${token}` } }
     );
+
     res.json(response.data);
   } catch (e) {
-    res.status(e.response?.status || 500).json({ error: e.response?.data?.error?.message || e.message });
+    res.status(e.response?.status || 500).json({
+      error: e.response?.data?.error?.message || e.message
+    });
   }
 });
 
@@ -90,14 +89,22 @@ app.post('/api/gsc', async (req, res) => {
     const token = await getGAToken();
     const response = await axios.post(
       `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(GSC_SITE)}/searchAnalytics/query`,
-      req.body, { headers: { Authorization: `Bearer ${token}` } }
+      req.body,
+      { headers: { Authorization: `Bearer ${token}` } }
     );
+
     res.json(response.data);
   } catch (e) {
-    res.status(e.response?.status || 500).json({ error: e.response?.data?.error?.message || e.message });
+    res.status(e.response?.status || 500).json({
+      error: e.response?.data?.error?.message || e.message
+    });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`\n✅ Centex Asphalt Dashboard running at http://localhost:${PORT}\n`));
+
+app.listen(PORT, () => {
+  console.log(`\n✅ Centex Asphalt Dashboard running at http://localhost:${PORT}\n`);
+});
+
 module.exports = app;
