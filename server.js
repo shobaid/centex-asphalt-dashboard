@@ -1,17 +1,12 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
-const cookieParser = require('cookie-parser');
 const { GoogleAuth } = require('google-auth-library');
-const { google } = require('googleapis');
-const bcrypt = require('bcryptjs');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 app.use(express.json());
-app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
 const GA4_PROPERTY = 'properties/497921278';
@@ -19,17 +14,24 @@ const GSC_SITE = 'https://centexasphalt.com/';
 const WC_PROFILE = '';
 const SHEET_ID = '';
 const SHEET_TAB = 'dashboard_data';
-const REVIEW_COOKIE = 'pp_reviewer';
 const DASH_COOKIE = 'centex-asphalt-dashboard';
+const REVIEW_COOKIE = 'pp_reviewer';
+const LAYOUT_FILE = path.join(__dirname, 'layout.json');
+
+// Sheet columns — injected by generator
+const SHEET_COLUMNS = [];
+const QUALIFIED_LABEL = 'Qualified Leads';
+
+// ── Supabase ───────────────────────────────────────────────────────────────
 
 // ── Google auth (service account) ─────────────────────────────────────────
-const serviceAccountCreds = {
-  client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-  private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n')
-};
-
 const gauth = new GoogleAuth({
-  credentials: serviceAccountCreds,
+  credentials: {
+    client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+    private_key: process.env.GOOGLE_PRIVATE_KEY 
+  ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n')
+  : require('fs').readFileSync(require('path').join(__dirname, 'private-key.pem'), 'utf8')
+  },
   scopes: [
     'https://www.googleapis.com/auth/analytics.readonly',
     'https://www.googleapis.com/auth/webmasters.readonly',
@@ -43,7 +45,7 @@ async function getGAToken() {
   return token.token;
 }
 
-// ── Reviewer session helpers ───────────────────────────────────────────────
+// ── Session helpers ────────────────────────────────────────────────────────
 const COOKIE_OPTS = {
   httpOnly: true,
   secure: process.env.NODE_ENV === 'production',
@@ -52,18 +54,40 @@ const COOKIE_OPTS = {
 };
 
 function signSession(data) {
-  return jwt.sign(data, process.env.SESSION_SECRET || 'pennpain-secret', { expiresIn: '7d' });
+  return jwt.sign(data, process.env.SESSION_SECRET || 'centex-asphalt-secret', { expiresIn: '7d' });
 }
 
 function readSession(req) {
   try {
     const token = req.cookies?.[REVIEW_COOKIE];
     if (!token) return null;
-    return jwt.verify(token, process.env.SESSION_SECRET || 'pennpain-secret');
-  } catch {
-    return null;
-  }
+    return jwt.verify(token, process.env.SESSION_SECRET || 'centex-asphalt-secret');
+  } catch { return null; }
 }
+
+// ── Layout API ─────────────────────────────────────────────────────────────
+app.get('/api/layout', (req, res) => {
+  try {
+    if (fs.existsSync(LAYOUT_FILE)) {
+      const layout = JSON.parse(fs.readFileSync(LAYOUT_FILE, 'utf8'));
+      res.json({ ok: true, layout });
+    } else {
+      res.json({ ok: true, layout: null });
+    }
+  } catch (e) {
+    res.json({ ok: true, layout: null });
+  }
+});
+
+app.post('/api/layout', (req, res) => {
+  try {
+    const { layout } = req.body;
+    fs.writeFileSync(LAYOUT_FILE, JSON.stringify(layout, null, 2));
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ── GA4 proxy ──────────────────────────────────────────────────────────────
 app.post('/api/ga4', async (req, res) => {
@@ -71,17 +95,105 @@ app.post('/api/ga4', async (req, res) => {
     const token = await getGAToken();
     const response = await axios.post(
       `https://analyticsdata.googleapis.com/v1beta/${GA4_PROPERTY}:runReport`,
-      req.body,
+      req.body, { headers: { Authorization: `Bearer ${token}` } }
+    );
+    res.json(response.data);
+  } catch (e) {
+    res.status(e.response?.status || 500).json({ error: e.response?.data?.error?.message || e.message });
+  }
+});
+
+// ── GA4 events proxy — auto-discovers all key events ──────────────────────
+app.get('/api/ga4/events', async (req, res) => {
+  try {
+    const { start_date, end_date } = req.query;
+    const token = await getGAToken();
+
+    // Step 1: Fetch all events with counts for this period
+    const totalsRes = await axios.post(
+      `https://analyticsdata.googleapis.com/v1beta/${GA4_PROPERTY}:runReport`,
+      {
+        dateRanges: [{ startDate: start_date, endDate: end_date }],
+        dimensions: [{ name: 'eventName' }],
+        metrics: [{ name: 'eventCount' }],
+        orderBys: [{ metric: { metricName: 'eventCount' }, desc: true }],
+        limit: 50
+      },
       { headers: { Authorization: `Bearer ${token}` } }
     );
 
-    res.json(response.data);
-  } catch (e) {
-    res.status(e.response?.status || 500).json({
-      error: e.response?.data?.error?.message || e.message
+    // Build event list — filter out GA4 system events
+    const systemEvents = new Set([
+      'session_start','first_visit','page_view','user_engagement',
+      'scroll','click','file_download','video_start','video_progress','video_complete',
+      'view_search_results','exception','purchase','add_to_cart','begin_checkout'
+    ]);
+
+    const allEvents = (totalsRes.data.rows || [])
+      .map(r => ({ name: r.dimensionValues[0].value, count: parseInt(r.metricValues[0].value) || 0 }))
+      .filter(e => e.count > 0 && !systemEvents.has(e.name));
+
+    if (allEvents.length === 0) {
+      return res.json({ groups: [], evMap: {} });
+    }
+
+    // Step 2: Fetch time series for all discovered events
+    const eventNames = allEvents.map(e => e.name);
+    const tsRes = await axios.post(
+      `https://analyticsdata.googleapis.com/v1beta/${GA4_PROPERTY}:runReport`,
+      {
+        dateRanges: [{ startDate: start_date, endDate: end_date }],
+        dimensions: [{ name: 'date' }, { name: 'eventName' }],
+        metrics: [{ name: 'eventCount' }],
+        dimensionFilter: { filter: { fieldName: 'eventName', inListFilter: { values: eventNames } } },
+        orderBys: [{ dimension: { dimensionName: 'date' } }],
+        limit: 5000
+      },
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    // Build time series map
+    const tsMap = {};
+    (tsRes.data.rows || []).forEach(r => {
+      const date = r.dimensionValues[0].value;
+      const event = r.dimensionValues[1].value;
+      if (!tsMap[date]) tsMap[date] = {};
+      tsMap[date][event] = parseInt(r.metricValues[0].value) || 0;
     });
+
+    const dates = Object.keys(tsMap).sort();
+
+    // Assign colors — cycle through palette
+    const palette = ['#3a8fd4','#a78bfa','#f59e0b','#34d399','#f87171','#60a5fa','#fb923c','#a3e635','#e879f9','#2dd4bf'];
+
+    // Build groups — each event is its own group
+    const evMap = {};
+    allEvents.forEach(e => { evMap[e.name] = e.count; });
+
+    const groups = allEvents.map((ev, i) => ({
+      key: ev.name.replace(/[^a-z0-9]/gi, '_'),
+      label: formatEventLabel(ev.name),
+      eventName: ev.name,
+      color: palette[i % palette.length],
+      total: ev.count,
+      timeseries: dates.map(date => ({ date, value: tsMap[date]?.[ev.name] || 0 }))
+    }));
+
+    res.json({ groups, evMap });
+  } catch (e) {
+    res.status(e.response?.status || 500).json({ error: e.response?.data?.error?.message || e.message });
   }
 });
+
+function formatEventLabel(eventName) {
+  // Convert snake_case event names to readable labels
+  return eventName
+    .replace(/_/g, ' ')
+    .replace(/\w/g, l => l.toUpperCase())
+    .replace(/^Ads Conversion/, 'Ads')
+    .replace(/Unique$/, '(Unique)')
+    .replace(/Repeat$/, '(Repeat)');
+}
 
 // ── GSC proxy ──────────────────────────────────────────────────────────────
 app.post('/api/gsc', async (req, res) => {
@@ -89,22 +201,14 @@ app.post('/api/gsc', async (req, res) => {
     const token = await getGAToken();
     const response = await axios.post(
       `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(GSC_SITE)}/searchAnalytics/query`,
-      req.body,
-      { headers: { Authorization: `Bearer ${token}` } }
+      req.body, { headers: { Authorization: `Bearer ${token}` } }
     );
-
     res.json(response.data);
   } catch (e) {
-    res.status(e.response?.status || 500).json({
-      error: e.response?.data?.error?.message || e.message
-    });
+    res.status(e.response?.status || 500).json({ error: e.response?.data?.error?.message || e.message });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`\n✅ Centex Asphalt Dashboard running at http://localhost:${PORT}\n`);
-});
-
+app.listen(PORT, () => console.log(`\n✅ Centex Asphalt Dashboard running at http://localhost:${PORT}\n`));
 module.exports = app;
